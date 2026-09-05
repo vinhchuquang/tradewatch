@@ -1,0 +1,41 @@
+# ─── Tài liệu riêng tư: KHÔNG lên GitHub ───────────────────────────
+# Lộ trình học cá nhân, mục tiêu nghề nghiệp, cấu hình máy, ghi chú riêng.
+# Mọi thứ trong đây là của bạn, không phải của repo.
+docs/private/
+CLAUDE.local.md
+
+# ─── Secrets ───────────────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+.cloudflare/
+wrangler.toml.local
+
+# ─── Dữ liệu & state: sinh lại được, và ăn disk ────────────────────
+data/
+warehouse/
+checkpoints/
+spark-checkpoints/
+*.parquet
+*.avro.dat
+
+# ─── Python ────────────────────────────────────────────────────────
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# ─── Spark ─────────────────────────────────────────────────────────
+spark-warehouse/
+metastore_db/
+derby.log
+
+# ─── OS / IDE ──────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
