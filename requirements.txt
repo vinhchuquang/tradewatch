@@ -1,0 +1,12 @@
+# Thư viện Python cho image `app`. Python trong image là 3.10.12 — kiểm tính
+# tương thích với bản đó, không phải với Python trên máy bạn.
+#
+# PIN CHÍNH XÁC (==), không dùng >= . "Không pin = không tái lập" (CLAUDE.md).
+#
+# Chưa điền: thư viện là quyết định của T0, không phải boilerplate.
+# Spec mục 6 đã chốt Avro qua fastavro. Còn lại (client WebSocket, driver
+# Postgres) tự chọn và ghi lý do vào README của thí nghiệm.
+#
+# pyspark KHÔNG cần ở đây — Spark đã có sẵn trong image gốc tại /opt/spark.
+# Cài lại bằng pip là có hai bản Spark trong một image, và bản nào chạy thì
+# tuỳ PYTHONPATH — đúng loại lỗi mất cả buổi để tìm.

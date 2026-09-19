@@ -1,0 +1,225 @@
+name: tradewatch
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3 image, 7 service. Xem ADR 0004.
+#
+#   kafka · postgres
+#   spark-master · spark-worker-1 · spark-worker-2    ── image `app`
+#   ingest · stream                                    ── image `app`
+#
+# LUẬT CỦA FILE NÀY:
+#   1. Mọi service khai mem_limit. Không có ngoại lệ.
+#   2. mem_limit LỚN HƠN heap khai bên trong. JVM còn metaspace, thread stack,
+#      buffer ngoài heap. Đặt bằng nhau = container biến mất mà log không nói gì.
+#   3. Dữ liệu nóng vào NAMED VOLUME, không bind mount. Bind mount trên Windows
+#      đi qua lớp 9P: thao tác file nhỏ chậm ~250 lần. Chỉ bind mount source code.
+#   4. depends_on phải có condition: service_healthy. Dạng rút gọn chỉ đợi
+#      container *khởi động*, không đợi nó *sẵn sàng* — Spark sẽ nối vào Kafka
+#      chưa nhận kết nối rồi chết, và lỗi đọc như lỗi mạng.
+# ─────────────────────────────────────────────────────────────────────────────
+
+x-app: &app
+  build:
+    context: .
+    dockerfile: Dockerfile
+  image: tradewatch/app:local
+  env_file: [.env]
+  # uid 185 là user `spark` trong image gốc. Named volume phải cho uid này ghi,
+  # nếu không container lên xong rồi chết đúng lúc ghi checkpoint đầu tiên.
+  user: "185"
+  restart: unless-stopped
+
+services:
+
+  # ── Kafka ──────────────────────────────────────────────────────────────────
+  kafka:
+    image: apache/kafka:4.1.0@sha256:bff074a5d0051dbc0bbbcd25b045bb1fe84833ec0d3c7c965d1797dd289ec88f
+    container_name: tw-kafka
+    mem_limit: 2g          # heap 1G + page cache + off-heap
+    cpus: 2.0
+    ports:
+      - "9092:9092"        # để chạy kafka-console-consumer từ host khi debug
+    environment:
+      # KRaft: broker và controller trong cùng một process, không có Zookeeper.
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      # Một broker duy nhất -> mọi replication factor phải là 1.
+      # Để mặc định 3 thì topic nội bộ không tạo được và Kafka chết im lặng.
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      # ⚠ 256MB, KHÔNG để mặc định 1GB. Kafka chỉ xoá được nguyên segment đã
+      # đóng, nên retention.bytes nhỏ hơn segment.bytes là không bao giờ chạy.
+      KAFKA_LOG_SEGMENT_BYTES: 268435456
+      KAFKA_LOG_RETENTION_BYTES: ${KAFKA_RETENTION_BYTES}
+      KAFKA_LOG_RETENTION_MS: ${KAFKA_RETENTION_MS}
+      # Kafka nhanh nhờ page cache của OS, không nhờ heap. Cấp hết cho JVM
+      # là làm Kafka chậm đi mà không rõ nguyên nhân.
+      KAFKA_HEAP_OPTS: "-Xmx1G -Xms1G"
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    healthcheck:
+      # Hỏi chính broker qua giao thức của nó. Kiểm cổng mở là chưa đủ:
+      # cổng mở trước khi broker sẵn sàng nhận produce/consume.
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 30s
+    restart: unless-stopped
+
+  # ── Postgres ───────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:17-alpine@sha256:f02121de6f74d30d8a94cd1d9584125e2178d7e6c377d8130112d4e52d867995
+    container_name: tw-postgres
+    mem_limit: 1g          # shared_buffers 256MB + work_mem + connection
+    cpus: 2.0
+    ports:
+      - "5432:5432"        # để chạy psql / EXPLAIN ANALYZE từ host
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      # initdb chỉ chạy lần đầu, khi volume còn rỗng.
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+    command:
+      - postgres
+      - -c
+      - shared_buffers=256MB
+      - -c
+      - max_connections=50
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    restart: unless-stopped
+
+  # ── Spark master ───────────────────────────────────────────────────────────
+  spark-master:
+    <<: *app
+    container_name: tw-spark-master
+    mem_limit: 512m        # chỉ điều phối, không chạy task
+    cpus: 1.0
+    ports:
+      - "8080:8080"        # UI của master: worker nào đã đăng ký, còn bao nhiêu core
+      - "7077:7077"
+    # Bỏ qua /opt/entrypoint.sh của image gốc và gọi thẳng spark-class.
+    # KHÔNG dùng sbin/start-master.sh — script đó daemon hoá rồi thoát,
+    # PID 1 chết thì container tắt ngay.
+    entrypoint: ["/opt/spark/bin/spark-class"]
+    command:
+      - org.apache.spark.deploy.master.Master
+      - --host
+      - spark-master
+      - --port
+      - "7077"
+      - --webui-port
+      - "8080"
+    healthcheck:
+      # /dev/tcp là tính năng của bash, không phải file thật. Không cần curl.
+      test: ["CMD-SHELL", "timeout 3 bash -c '</dev/tcp/localhost/8080' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  # ── Spark worker × 2 ───────────────────────────────────────────────────────
+  # HAI worker, không phải một. Một worker thì skew không nhìn thấy được:
+  # phải có cái thứ hai ngồi chơi mới thấy cái thứ nhất đang gánh hết.
+  spark-worker-1:
+    <<: *app
+    container_name: tw-spark-worker-1
+    mem_limit: 2g          # ⚠ LỚN HƠN --memory 1500m bên dưới
+    cpus: 2.0
+    depends_on:
+      spark-master: {condition: service_healthy}
+    entrypoint: ["/opt/spark/bin/spark-class"]
+    command:
+      - org.apache.spark.deploy.worker.Worker
+      - spark://spark-master:7077
+      - --cores
+      - "2"
+      - --memory
+      - 1500m
+      - --webui-port
+      - "8081"
+    volumes:
+      - spark_work:/opt/spark/work
+
+  spark-worker-2:
+    <<: *app
+    container_name: tw-spark-worker-2
+    mem_limit: 2g
+    cpus: 2.0
+    depends_on:
+      spark-master: {condition: service_healthy}
+    entrypoint: ["/opt/spark/bin/spark-class"]
+    command:
+      - org.apache.spark.deploy.worker.Worker
+      - spark://spark-master:7077
+      - --cores
+      - "2"
+      - --memory
+      - 1500m
+      - --webui-port
+      - "8081"
+    volumes:
+      - spark_work:/opt/spark/work
+
+  # ── Ingest: Binance WebSocket -> Kafka ─────────────────────────────────────
+  # Không dùng Spark. Chỉ là một client WebSocket. Dùng chung image cho đỡ
+  # phải bảo trì hai Dockerfile.
+  ingest:
+    <<: *app
+    container_name: tw-ingest
+    mem_limit: 512m
+    cpus: 1.0
+    depends_on:
+      kafka: {condition: service_healthy}
+    volumes:
+      - ./src:/app/src:ro          # bind mount source: vài chục file, 9P không đáng kể
+    command: ["python3", "-m", "src.ingest"]
+    profiles: ["run"]              # không tự lên khi `make up`
+
+  # ── Stream: Spark Structured Streaming ─────────────────────────────────────
+  stream:
+    <<: *app
+    container_name: tw-stream
+    mem_limit: 2g          # ⚠ LỚN HƠN SPARK_DRIVER_MEMORY
+    cpus: 2.0
+    ports:
+      - "4040:4040"        # UI của driver: job, stage, task chia trên executor nào
+    depends_on:
+      kafka: {condition: service_healthy}
+      postgres: {condition: service_healthy}
+      spark-master: {condition: service_healthy}
+    environment:
+      # ⚠ spark.driver.memory trong SparkSession.builder.config(...) KHÔNG có
+      # tác dụng — JVM khởi động trước khi Python đọc tới đó. Phải đặt ở đây.
+      SPARK_DRIVER_MEMORY: 1500m
+    volumes:
+      - ./src:/app/src:ro
+      - checkpoint:/app/checkpoint
+      - parquet:/app/parquet
+    command: ["python3", "-m", "src.stream"]
+    profiles: ["run"]
+
+volumes:
+  # Named volume: nằm trong ext4 của VM Docker, không đi qua lớp 9P.
+  # Xoá bằng `docker volume rm` (make clean), KHÔNG bằng rm -rf.
+  kafka_data:
+  pg_data:
+  checkpoint:
+  parquet:
+  spark_work:
