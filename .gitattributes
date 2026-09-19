@@ -1,0 +1,26 @@
+# Repo này chạy trên Windows+WSL2 và trên Linux native. Cùng một file phải cho
+# ra cùng một byte ở cả hai chỗ, nếu không "chạy máy tôi thì được" là chuyện
+# thời gian.
+#
+# Vì sao quan trọng: mọi thứ dưới đây được đọc bên TRONG container Linux.
+# File có CRLF thì shell coi \r là một phần của lệnh và báo
+#   /bin/bash^M: bad interpreter
+# hoặc  command not found: bash\r
+# Lỗi đọc như "lệnh không tồn tại" trong khi lệnh tồn tại hoàn toàn.
+
+* text=auto eol=lf
+
+# Ép LF tuyệt đối, không để autocrlf của máy quyết định
+Makefile        text eol=lf
+Dockerfile      text eol=lf
+*.sh            text eol=lf
+*.yml           text eol=lf
+*.yaml          text eol=lf
+*.py            text eol=lf
+*.sql           text eol=lf
+.env.example    text eol=lf
+
+# Nhị phân: không đụng vào
+*.parquet       binary
+*.avro          binary
+*.png           binary
