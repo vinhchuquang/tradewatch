@@ -62,22 +62,29 @@ Giả định máy dev cũng là máy làm việc, không phải máy lab riêng
 | Desktop + browser + editor | **~6GB** — ưu tiên cao nhất |
 | Kafka | 1GB heap (`KAFKA_HEAP_OPTS=-Xmx1G -Xms1G`), `mem_limit: 2g`. Kafka nhanh nhờ page cache của OS, không nhờ heap |
 | Postgres | `shared_buffers=256MB`, `mem_limit: 1g` |
-| Spark driver | **3GB** (local mode: driver làm hết, không có executor riêng) |
+| spark-master | **512MB** — chỉ điều phối, không chạy task |
+| spark-worker × 2 | **2GB mỗi cái** — nơi task thật sự chạy |
+| Spark driver (`stream`) | **2GB** — submit lên master, không phải `local[*]` |
 | Chừa page cache | ~5GB |
 
-Chạy job dài **phải** có trần cgroup, `systemd` sẵn có:
+Trần RAM là **bắt buộc**, không phải tuỳ chọn. Mọi service khai `mem_limit` trong `docker-compose`:
 
-```bash
-systemd-run --user --scope -p MemoryMax=4G -p CPUQuota=400% make stream
+```yaml
+stream:
+  mem_limit: 3g
+  cpus: 4.0
 ```
 
-Vượt trần thì job bị kill, không phải desktop bị đóng băng.
+Vượt trần thì container bị OOM-kill, không phải desktop bị đóng băng. Đây là lý do **không** chạy Spark trên host: trên host phải nhớ bọc `systemd-run --scope`, quên một lần là treo máy; trong compose thì trần nằm sẵn trong file, không quên được.
 
-**Cạm bẫy:** `spark.driver.memory` trong `SparkSession.builder.config(...)` **không có tác dụng** — JVM đã khởi động trước khi Python đọc tới đó. Đặt qua `spark-defaults.conf`, `SPARK_DRIVER_MEMORY`, hoặc `spark-submit --driver-memory 4g`.
+**Hai cạm bẫy RAM:**
+
+1. `spark.driver.memory` trong `SparkSession.builder.config(...)` **không có tác dụng** — JVM khởi động trước khi Python đọc tới đó. Đặt qua biến môi trường `SPARK_DRIVER_MEMORY` trong compose
+2. `mem_limit` phải **lớn hơn** `SPARK_DRIVER_MEMORY`. JVM còn metaspace, thread stack, buffer ngoài heap. Đặt bằng nhau là container chết vì OOM trong khi heap vẫn còn chỗ — và log Spark sẽ không nói gì, container chỉ biến mất
 
 ## Chạy được trên hai máy
 
-Dự án chạy trên Linux native và trên Windows+WSL2. `make test` phải pass ở cả hai. **Lệch nhau nghĩa là có thứ chưa pin** — sửa cái pin, đừng thêm nhánh `if`.
+Dự án chạy trên Linux native và trên Windows+WSL2. `make test` phải pass ở cả hai. **Lệch nhau nghĩa là có thứ chưa pin** — sửa cái pin, đừng thêm nhánh `if`. Đóng gói runtime vào image là cách pin mạnh nhất: nó pin cả JVM và thư viện hệ điều hành, thứ mà `uv.lock` không chạm tới.
 
 Nguồn chân lý là git remote, không phải một máy cụ thể. Job chạy dài phải ở trong `tmux`.
 
@@ -87,12 +94,16 @@ Nguồn chân lý là git remote, không phải một máy cụ thể. Job chạ
 
 Muốn thêm bất cứ tool nào: **viết ADR nói nó chặn lỗi cụ thể nào.** Không có ADR thì không thêm. Nguyên tắc: *mỗi thành phần chỉ được vào nếu nó chặn được một lỗi cụ thể.*
 
-Kiến trúc hiện tại: **2 container** (`kafka`, `postgres`) + Spark cài trực tiếp bằng `uv` trên host WSL. Đừng đóng gói Spark vào container — image ~2GB so với ~700MB.
+Kiến trúc hiện tại: **3 image, 7 service** — `kafka`, `postgres`, `spark-master`, `spark-worker-1`, `spark-worker-2`, `ingest`, `stream`. Ba cái cuối cùng dùng chung image `app`. Xem [ADR 0004](docs/adr/0004-spark-trong-container.md).
+
+**Không dùng `local[*]`.** Local mode giấu đi tách driver/executor, và ba thí nghiệm skew / chẩn đoán lag / state phình mất phần lớn ý nghĩa vì chuyện đó.
+
+**Checkpoint, Parquet, dữ liệu Kafka/Postgres đi vào named volume, không bind mount.** Bind mount trên Windows đi qua lớp 9P: thao tác file nhỏ chậm ~250 lần so với ext4 (đo thật). Chỉ bind mount source code — vài chục file, không đáng kể.
 
 ## Lệnh
 
 ```bash
-make up          # 2 container, có disk-guard chặn nếu <3GB trống
+make up          # 7 service, có disk-guard chặn nếu <3GB trống
 make ingest      # Binance WebSocket -> Kafka
 make stream      # Spark streaming job
 make test        # unit + contract
