@@ -39,3 +39,7 @@ derby.log
 Thumbs.db
 .idea/
 .vscode/
+
+# ─── Browser automation ────────────────────────────────
+# Snapshot trang và console log — có thể chứa token session.
+.playwright-mcp/
